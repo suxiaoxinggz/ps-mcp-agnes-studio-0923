@@ -71,13 +71,15 @@
 
 | 工具名 | 说明 |
 |--------|------|
-| `agnes_image_generate` | 文生图 / 图生图（`agnes-image-2.1-flash`），精确像素尺寸 |
-| `agnes_image_generate_v2` | 高信息密度图像生成（`agnes-image-2.1-flash`），分级尺寸 `1K`–`4K` + 宽高比 |
+| `agnes_image_generate` | 文生图 / 图生图 / 多图合成（默认 `agnes-image-2.5-flash`），档位 `1K`–`4K` + `ratio` 或精确像素尺寸 |
+| `agnes_image_generate_v2` | 高信息密度图像生成（默认 `agnes-image-2.5-flash`），分级尺寸 `1K`–`4K` + 宽高比 |
 | `agnes_image_edit` | 图像编辑 / 多图合成，通过 `extra_body.image` 传入参考图 |
-| `agnes_video_submit` | 提交视频生成任务（`POST /videos`），返回 `video_id` |
-| `agnes_video_status` | 查询视频任务状态（`GET /agnesapi?video_id=<VIDEO_ID>`） |
-| `agnes_video_wait` | 轮询任务直至完成、失败或超时 |
+| `agnes_video_submit` | 提交视频任务（`POST /videos`，异步），返回 `video_id`；`mode` = `text`/`keyframe`/`reference` |
+| `agnes_video_status` | 查询视频任务状态（`GET /agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL>`，推荐带 model_name） |
+| `agnes_video_wait` | 轮询任务直至完成、失败或超时（可自动下载 mp4） |
 | `agnes_video_generate` | 提交视频任务并等待完成（submit + wait 组合） |
+
+> **视频模型**：默认 `agnes-video-2.5-flash`（限时免费，仅 `720P`，参考图 ≤5、参考音频 ≤3、不支持参考视频）；`agnes-video-2.5` 收费（720P $0.025/s、1080P/1K $0.040/s、2K $0.055/s）；`agnes-video-v2.0` 接口兼容 2.5。通过 `AGNES_VIDEO_MODEL` 或工具 `extra_body.model` 切换。视频队列满（503 `video_queue_full`）时用 `video_retry.py` 后台重试（见注意事项）。
 
 ## 完整安装配置指南
 
@@ -249,9 +251,9 @@ Skill 默认在调用 Agnes 前将非英文描述优化为自然英文；这通�
 
 > **你：** 用 agnes 做一个 5 秒的视频：一只猫在窗台上打盹，阳光慢慢移动
 >
-> **Agent：** 调用 `agnes_video_generate`（duration=5, resolution=720p）→ 等待 30s~3min → 返回视频文件
+> **Agent：** 调用 `agnes_video_generate`（mode="text", seconds="5", size="720P", aspect_ratio="16:9"）→ 自动轮询 → 返回视频文件
 >
-> **你获得：** 一个 MP4 文件，保存在 `outputs/videos/` 目录
+> **你获得：** 一个 MP4 文件，保存在 `outputs/videos/` 目录；如遇 503 队列满，改用 `video_retry.py` 后台重试（见注意事项）
 
 ### 触发规则
 
@@ -321,9 +323,12 @@ result = asyncio.run(
 - Base URL 使用国内端点：`https://api.agnes-ai.cn/v1`
 - `response_format` 必须放在 `extra_body` 内，不可置于请求体顶层
 - 图生图不使用 `tags: ["img2img"]`，参考图通过 `extra_body.image` 传入
-- `agnes_image_generate_v2` 使用 `agnes-image-2.1-flash`，支持 `1K`–`4K` 分级尺寸 + `ratio` 宽高比
-- 视频 `num_frames` 自动对齐 `8n+1` 规则（上限 441）
-- 视频状态轮询使用 `video_id`，端点为 `GET /agnesapi?video_id=<VIDEO_ID>`
+- `agnes_image_generate_v2` 默认 `agnes-image-2.5-flash`（2026-09 起图片模型为 2.5/2.1/2.0-flash 三代），支持 `1K`–`4K` 分级尺寸 + `ratio` 宽高比
+- 视频状态轮询使用 `video_id` + `model_name`，端点为 `GET /agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL>`（不带 model_name 仅适用 `mode:"text"`）
+- 视频 `seconds` 为字符串 `"4"`–`"12"`；Flash 模型 `size` 仅支持 `720P`，且不接受参考视频
+- **免费视频队列经常满载（503 `video_queue_full`）**：用后台重试脚本代替阻塞等待——
+  `nohup python3 video_retry.py --prompt "..." --seconds 5 --size 720P --notify > /tmp/agnes-video-retry.log 2>&1 &`
+  （每 10 分钟重试提交，成功后自动轮询、下载 mp4 并发 macOS 通知；`--max-submit-attempts 3` 可限制重试次数）
 - 视频结果 URL 从响应的顶层 `url` 字段提取（实测），同时兼容 `metadata.url`（官方文档示例）
 - 成功响应仅返回归一化关键字段，不返回完整 `raw`；HTTP 错误仍保留服务端响应正文
 - `mask_path` 参数会返回结构化不支持错误（当前文档未描述 mask 功能）

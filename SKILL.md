@@ -57,6 +57,13 @@ Preserve intent, proper nouns, numbers, camera directions, and quoted/on-screen 
 - `response_format` must be placed inside `extra_body`; `return_base64` is top-level. Never send `tags: ["img2img"]`; never send `width`/`height`/`fps`/`num_frames` to video tools.
 - Mask-based editing is unsupported.
 - On 429 or 503, wait and retry. On timeout, report `video_id` so polling can continue. For other errors, report the returned code and message.
+- **Video queue full (503 `video_queue_full`)**: the free `agnes-video-2.5-flash` queue is often saturated for hours. Do NOT block the conversation retrying inline. Launch the background retry script instead:
+
+  ```bash
+  cd <repo root> && nohup python3 video_retry.py --prompt "..." --seconds 5 --size 720P --notify > /tmp/agnes-video-retry.log 2>&1 &
+  ```
+
+  It retries every `--interval` seconds (default 600), polls after acceptance, downloads the mp4 to `outputs/videos/`, and sends a macOS notification when ready. Tell the user the log path (`/tmp/agnes-video-retry.log`) and that they will be notified. Alternatively, offer the paid `agnes-video-2.5` model for immediate generation (720P ≈ $0.125 for 5s) — only with the user's explicit consent.
 
 ## Output
 
