@@ -1,270 +1,68 @@
-# 视频 API 文档
+# Agnes Video API（2.5 / 2.5-flash / v2.0）
 
-## 概述
+OpenAI Videos 兼容异步 API：先 `POST /v1/videos` 创建任务，再用 `video_id` + `model_name` 轮询。
 
-Agnes Media MCP 提供异步视频生成能力，基于 `agnes-video-v2.0` 模型。工作流程为：提交任务 → 获取 `video_id` → 轮询状态 → 获取结果。
+- 创建：`POST https://apihub.agnes-ai.com/v1/videos`（国内站 `https://api.agnes-ai.cn/v1/videos`）
+- 查询：`GET https://apihub.agnes-ai.com/agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL>`
+- 模型：`agnes-video-2.5`（收费）/ `agnes-video-2.5-flash`（限时免费，仅 720P）/ `agnes-video-v2.0`（旧版，接口兼容 2.5）
 
-| 工具 | 说明 |
-|------|------|
-| `agnes_video_submit` | 提交视频任务，立即返回 `video_id` |
-| `agnes_video_status` | 查询指定 `video_id` 的当前状态 |
-| `agnes_video_wait` | 持续轮询直至完成/失败/超时 |
-| `agnes_video_generate` | 提交 + 等待组合，一步到位 |
+## 创建参数
 
-## API 端点
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `model` | 是 | `agnes-video-2.5` / `agnes-video-2.5-flash` / `agnes-video-v2.0` |
+| `prompt` | 是 | 主体+动作+镜头+风格(+声音)；reference 模式用 `<Picture N>` / `<Audio N>` / `<Video N>` 指代素材 |
+| `mode` | 是 | `text`（纯文生视频）/ `keyframe`（首尾帧）/ `reference`（图/音/视频参考） |
+| `seconds` | 否 | 字符串 `"4"`–`"12"`，默认 `"5"` |
+| `size` | 否 | `720P` / `1080P` / `1K`(=1024x1024) / `2K`；**flash 仅 `720P`** |
+| `aspect_ratio` | 否 | 默认 `16:9`；支持 `21:9` `16:9` `4:3` `1:1` `3:4` `9:16`（+`2:3` `3:2`），不支持 `auto` |
+| `seed` | 否 | 整数 |
+| `n` | 否 | 仅支持 `1` |
 
-| 操作 | 端点 |
-|------|------|
-| 创建任务 | `POST https://api.agnes-ai.cn/v1/videos` |
-| 查询结果（推荐） | `GET https://api.agnes-ai.cn/agnesapi?video_id=<VIDEO_ID>` |
-| 查询结果（兼容） | `GET https://api.agnes-ai.cn/v1/videos/<TASK_ID>` |
+## 模式规则
 
-本工具使用推荐的 `video_id` 端点。
+| mode | 必需媒体 | 禁止字段 |
+|---|---|---|
+| text | 无 | first_frame / last_frame / images / audios / videos |
+| keyframe | first_frame 与/或 last_frame | images / audios / videos |
+| reference | images / audios / videos 至少一类 | first_frame / last_frame |
 
-## agnes_video_submit
+- `keyframe`：输入图保持为真实首/尾帧；`reference`：素材作为内容/风格/节奏参考，可能重新构图
+- 参考视频对象：`{url, start_seconds, require_audio}`
 
-提交视频生成任务，立即返回任务信息。
+## 媒体限制
 
-### 参数
+| 媒体 | 2.5 | 2.5-flash |
+|---|---|---|
+| 图片 | ≤8 张，单张 <15MB，总计 <50MB，宽高 256–5760 | ≤5 张 |
+| 音频 | ≤3 段，单段 <15MB，2–12s，总计 <64MB | ≤3 段 |
+| 视频 | ≤1 个，2–12s，<50MB，24–60 FPS | ❌ 不支持（400） |
 
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `prompt` | string | 是 | — | 视频内容描述 |
-| `duration` | float | 否 | `5.0` | 目标时长（秒），自动转换为 `num_frames` |
-| `frame_rate` | int | 否 | `24` | 帧率（1–60）。官方类型为 number，MCP 收窄为 int |
-| `resolution` | string | 否 | `"720p"` | 分辨率：`480p`、`720p`、`1080p` 或精确尺寸如 `1152x768` |
-| `aspect_ratio` | string | 否 | `"16:9"` | 宽高比：`16:9`、`9:16`、`1:1`、`4:3`、`3:4` |
-| `image` | string | 否 | `None` | 图生视频输入图像 URL |
-| `mode` | string | 否 | `None` | 生成模式：`ti2vid`（图生视频）、`keyframes`（关键帧动画） |
-| `negative_prompt` | string | 否 | `None` | 负面提示词，描述需要避免的内容 |
-| `extra_body` | dict | 否 | `None` | 附加参数（如 `seed`、`num_inference_steps`） |
+单次请求参考媒体总数 ≤12。
 
-### num_frames 对齐规则
+## 查询与响应
 
-视频 API 要求 `num_frames` 满足：
-- **≤ 441**（最大帧数限制）
-- **符合 `8n + 1` 规则**（如 81、121、241、441）
+- 所有模式推荐：`GET /agnesapi?video_id=<ID>&model_name=<MODEL>`；不带 `model_name` 的查询仅适用 `mode: "text"`
+- 状态：`queued` / `in_progress` / `completed` / `failed`；以 `status` 和顶层 `url` 为准（`internal_status`/`internal_progress` 是内部字段）
+- 建议 1–2s 轮询；对 429/网络超时做退避重试，设置最大轮询时长
 
-本工具自动将 `duration × frame_rate` 对齐到最近的合法值。
+## Flash 专属校验（顺序：size → images → audios → videos）
 
-| 目标时长 | 推荐参数 |
-|----------|----------|
-| 约 3 秒 | `num_frames: 81`, `frame_rate: 24` |
-| 约 5 秒 | `num_frames: 121`, `frame_rate: 24` |
-| 约 10 秒 | `num_frames: 241`, `frame_rate: 24` |
-| 约 18 秒 | `num_frames: 441`, `frame_rate: 24` |
+- `size must be 720P`（其他值 400）
+- `images length must not exceed 5`
+- `audios length must not exceed 3`
+- `videos is not supported`
 
-### 示例
+## 尺寸映射
 
-```python
-# 文生视频
-result = agnes.agnes_video_submit(
-    prompt="电影感镜头，猫在日落海滩上行走，柔和海浪",
-    duration=5,
-    resolution="720p",
-    aspect_ratio="16:9",
-)
-print(result["video_id"])  # 用于后续查询
+2.5：720P/1080P 按 ratio 映射（16:9 → 1280x720 / 1920x1080），1K 固定 1024x1024，2K 为 720P 的 2 倍。
+2.5-flash（720P）：21:9→1680x720、16:9→1280x704、4:3→960x720、1:1→720x720、3:4→720x960、9:16→720x1280。
 
-# 图生视频
-result = agnes.agnes_video_submit(
-    prompt="人物缓慢转身回望镜头，自然表情，电影运镜",
-    image="https://example.com/portrait.png",
-    duration=5,
-)
+## 不支持的写法（400）
 
-# 关键帧动画
-result = agnes.agnes_video_submit(
-    prompt="在两个关键帧之间生成平滑过渡，保持视觉一致性",
-    mode="keyframes",
-    extra_body={
-        "image": [
-            "https://example.com/keyframe1.png",
-            "https://example.com/keyframe2.png",
-        ],
-    },
-)
-```
+`video_url`/`video_path`/`video_reference`（用 `videos[].url`）；`input_reference`/`reference_url`；`width`/`height`/`fps`/`num_frames`/`quality`/`num_inference_steps`；`size` 写成像素（如 `1280x720`）；`aspect_ratio: "auto"`；`n != 1`。
 
-> **实际发送的 HTTP 请求体（关键帧示例）：**
->
-> ```json
-> {
->   "model": "agnes-video-v2.0",
->   "prompt": "在两个关键帧之间生成平滑过渡，保持视觉一致性",
->   "num_frames": 121,
->   "frame_rate": 24,
->   "width": 1280,
->   "height": 720,
->   "extra_body": {
->     "mode": "keyframes",
->     "image": ["https://example.com/keyframe1.png", "https://example.com/keyframe2.png"]
->   }
-> }
-> ```
->
-> 普通图生视频通过请求体顶层的 `image`（以及可选的顶层 `mode`）传图；关键帧动画才使用 `extra_body.image` 数组和 `extra_body.mode="keyframes"`。
+## 计费
 
-### 响应
-
-```json
-{
-  "ok": true,
-  "task_id": "task_YOUR_TASK_ID",
-  "video_id": "video_YOUR_VIDEO_ID",
-  "status": "queued",
-  "progress": 0,
-  "seconds": "5.0",
-  "size": "1152x768",
-  "video_url": null
-}
-```
-
-## agnes_video_status
-
-查询视频任务的当前状态。
-
-### 参数
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `video_id` | string | 是 | 提交任务时返回的 `video_id` |
-
-### 任务状态
-
-| 状态 | 说明 |
-|------|------|
-| `queued` | 任务在队列中等待 |
-| `in_progress` | 视频正在生成 |
-| `completed` | 视频生成成功 |
-| `failed` | 视频生成失败 |
-
-### 示例
-
-```python
-result = agnes.agnes_video_status("video_YOUR_VIDEO_ID")
-print(result["status"])  # "queued" / "in_progress" / "completed" / "failed"
-```
-
-## agnes_video_wait
-
-持续轮询任务状态直至完成、失败或超时。
-
-### 参数
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `video_id` | string | 是 | — | 任务 `video_id` |
-| `timeout_seconds` | float | 否 | `600.0` | 最大等待时间（秒） |
-| `poll_interval_seconds` | float | 否 | `5.0` | 轮询间隔（秒） |
-| `download` | bool | 否 | `True` | 完成后是否自动下载视频文件 |
-| `output_filename` | string | 否 | `None` | 自定义输出文件名 |
-
-轮询过程中遇到状态查询限流（429）或服务暂时不可用（503）时，工具会按 `poll_interval_seconds` 自动重试；其他查询错误会立即返回。
-
-### 示例
-
-```python
-result = agnes.agnes_video_wait(
-    "video_YOUR_VIDEO_ID",
-    timeout_seconds=300,
-    poll_interval_seconds=5,
-)
-if result["ok"]:
-    print(result["local_path"])  # 本地视频文件路径
-```
-
-## agnes_video_generate
-
-提交任务并等待完成的组合工具。
-
-### 参数
-
-包含 `agnes_video_submit` 的全部参数，加上：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `timeout_seconds` | float | 否 | `600.0` | 最大等待时间 |
-| `poll_interval_seconds` | float | 否 | `5.0` | 轮询间隔 |
-| `download` | bool | 否 | `True` | 是否自动下载 |
-| `output_filename` | string | 否 | `None` | 自定义文件名 |
-
-### 示例
-
-```python
-result = agnes.agnes_video_generate(
-    prompt="宇航员在红色沙漠星球上行走，尘土飞扬，慢速跟踪镜头",
-    duration=5,
-    resolution="720p",
-    aspect_ratio="16:9",
-    negative_prompt="模糊, 低质量, 变形",
-)
-
-if result["ok"]:
-    print(result["video_url"])   # 远程视频 URL
-    print(result["local_path"])  # 本地文件路径
-```
-
-## 完成响应
-
-任务完成时，视频 URL 通过 `metadata.url` 返回（官方文档推荐位置）。实测中也可能出现在顶层 `url` 字段（此时 `metadata` 为 `null`）。本工具对两种位置均能自动提取：
-
-```json
-{
-  "ok": true,
-  "task_id": "task_YOUR_TASK_ID",
-  "video_id": "video_YOUR_VIDEO_ID",
-  "status": "completed",
-  "progress": 100,
-  "seconds": "5.0",
-  "size": "1152x768",
-  "video_url": "https://platform-outputs.agnes-ai.space/videos/agnes-video-v2.0/video_xxx.mp4",
-  "local_path": "/path/to/outputs/videos/agnes-media-xxx.mp4"
-}
-```
-
-成功响应会将常用任务信息和 `metadata.url` 归一化到顶层，不返回完整 `raw`、重复 `metadata` 或提交阶段副本。HTTP 错误保留 `error.details.body`；超时或任务失败时，`last_response.raw` 保留最后一次服务端响应。
-
-## 推荐参数
-
-| 场景 | 推荐设置 |
-|------|----------|
-| 标准视频 | `width: 1152`, `height: 768`, `num_frames: 121`, `frame_rate: 24` |
-| 社交短视频 | `num_frames: 81` 或 `121`, `frame_rate: 24` |
-| 更长视频 | 增大 `num_frames` 或降低 `frame_rate` |
-| 更流畅运动 | `frame_rate: 24` 或 `30` |
-| 可复现结果 | 设置固定 `seed`（通过 `extra_body`） |
-| 关键帧过渡 | `mode: "keyframes"` + `extra_body.image` 数组 |
-| 避免特定内容 | 使用 `negative_prompt` |
-
-## 提示词最佳实践
-
-### 文生视频
-
-```
-[主体] + [动作] + [场景] + [运镜] + [光线] + [风格]
-```
-
-示例：`年轻宇航员走过红色沙漠星球，尘土飞扬，慢速电影跟踪镜头，戏剧性日落光线，写实科幻风格`
-
-### 图生视频
-
-描述需要运动的部分和需要保持稳定的主体元素。
-
-示例：`让人物产生微弱的呼吸动态，头发在风中轻轻飘动，背景灯光柔和闪烁，保持面部和服装一致`
-
-### 关键帧动画
-
-清晰描述关键帧之间的过渡关系。
-
-示例：`从第一个关键帧平滑过渡到第二个关键帧，保持角色一致性、镜头角度连贯、场景间自然运动`
-
-## 错误码
-
-| HTTP 状态码 | 说明 |
-|-------------|------|
-| 400 | 请求无效，检查参数 |
-| 401 | 未授权，检查 API Key |
-| 404 | 任务或视频未找到 |
-| 500 | 服务器错误 |
-| 503 | 服务繁忙，稍后重试 |
+2.5：`视频总额 = (输出秒数 + 输入视频秒数) × 分辨率单价 + max(0, 图片数-5) × $0.005`；单价：720P $0.025/s、1080P/1K $0.040/s、2K $0.055/s。
+2.5-flash：**限时 $0/s**（同公式，单价为 0）。示例：8s 720P 输出 + 3s 输入视频 + 7 张图 = (8+3)×$0.025 + 2×$0.005 = $0.285。

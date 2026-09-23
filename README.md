@@ -1,5 +1,7 @@
 # Agnes Media MCP
 
+> **2026-09 模型与视频 API 更新**：图片模型更新为 `agnes-image-2.5-flash`（默认）/ `2.1-flash` / `2.0-flash`，均支持 `1K`–`4K` 档位 + `ratio`（2.0 兼容历史精确尺寸）。视频 API 重写为 OpenAI Videos 兼容异步接口：`POST /v1/videos` 创建 → `GET /agnesapi?video_id=&model_name=` 轮询，模式 `text` / `keyframe` / `reference`，模型 `agnes-video-2.5-flash`（限时免费，仅 720P）/ `agnes-video-2.5`（收费）/ `agnes-video-v2.0`。最新参数以 `SKILL.md` 与 `docs/image-api.md`、`docs/video-api.md` 为准。
+
 [English](README_EN.md)
 
 基于 FastMCP 的 Agnes 图像与视频生成 MCP 服务器（国内版）。

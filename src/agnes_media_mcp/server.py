@@ -21,9 +21,23 @@ load_dotenv()
 mcp = FastMCP("Agnes Media MCP")
 
 DEFAULT_BASE_URL = "https://api.agnes-ai.cn/v1"
-DEFAULT_IMAGE_MODEL = "agnes-image-2.1-flash"
-DEFAULT_IMAGE_MODEL_V2 = "agnes-image-2.1-flash"
-DEFAULT_VIDEO_MODEL = "agnes-video-v2.0"
+DEFAULT_IMAGE_MODEL = "agnes-image-2.5-flash"
+DEFAULT_IMAGE_MODEL_V2 = "agnes-image-2.5-flash"
+DEFAULT_VIDEO_MODEL = "agnes-video-2.5-flash"
+
+SUPPORTED_IMAGE_MODELS = (
+    "agnes-image-2.5-flash",   # 最新，免费
+    "agnes-image-2.1-flash",   # 免费，与 2.5 同 schema
+    "agnes-image-2.0-flash",   # 免费，兼容历史精确尺寸
+)
+SUPPORTED_VIDEO_MODELS = (
+    "agnes-video-2.5-flash",   # 限时免费；仅 720P；images<=5；audios<=3；不支持参考视频
+    "agnes-video-2.5",         # 收费：720P $0.025/s、1080P/1K $0.040/s、2K $0.055/s
+    "agnes-video-v2.0",        # 旧版模型，接口兼容 2.5
+)
+VIDEO_SIZES = ("720P", "1080P", "1K", "2K")
+VIDEO_ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "2:3", "3:2")
+VIDEO_MODES = ("text", "keyframe", "reference")
 # 可编辑源码树中锚定项目根；安装到 site-packages 时退化到 CWD
 _src_root = Path(__file__).resolve().parent.parent.parent
 if (_src_root / "pyproject.toml").exists():
@@ -555,52 +569,100 @@ def _align_num_frames(raw_frames: int) -> int:
     return min(max(1, aligned), 441)
 
 
+
+
+def _validate_video_request(
+    *,
+    model: str,
+    mode: str,
+    size: str,
+    seconds: str,
+    aspect_ratio: str,
+    first_frame: str | None,
+    last_frame: str | None,
+    images: list[str] | None,
+    audios: list[str] | None,
+    videos: list[dict[str, Any]] | None,
+) -> str | None:
+    """Return an error message when the request violates Agnes video rules."""
+    if mode not in VIDEO_MODES:
+        return f"mode must be one of {'/'.join(VIDEO_MODES)}."
+    if seconds and (not seconds.isdigit() or not 4 <= int(seconds) <= 12):
+        return "seconds must be a numeric string between '4' and '12'."
+    if aspect_ratio not in VIDEO_ASPECT_RATIOS:
+        return f"aspect_ratio must be one of {'/'.join(VIDEO_ASPECT_RATIOS)}."
+    if model.startswith("agnes-video-2.5-flash"):
+        if size != "720P":
+            return "agnes-video-2.5-flash only supports size '720P'."
+        if videos:
+            return "agnes-video-2.5-flash does not support reference videos."
+        if images and len(images) > 5:
+            return "agnes-video-2.5-flash supports at most 5 reference images."
+        if audios and len(audios) > 3:
+            return "agnes-video-2.5-flash supports at most 3 reference audios."
+    else:
+        if size not in VIDEO_SIZES:
+            return f"size must be one of {'/'.join(VIDEO_SIZES)}."
+        if images and len(images) > 8:
+            return "At most 8 reference images are allowed."
+        if videos and len(videos) > 1:
+            return "At most 1 reference video is allowed."
+    media_fields = (bool(first_frame or last_frame), bool(images), bool(audios), bool(videos))
+    if mode == "text" and any(media_fields):
+        return "mode='text' must not include first_frame/last_frame/images/audios/videos."
+    if mode == "keyframe":
+        if not (first_frame or last_frame):
+            return "mode='keyframe' requires first_frame or last_frame."
+        if images or audios or videos:
+            return "mode='keyframe' must not include images/audios/videos."
+    if mode == "reference":
+        if first_frame or last_frame:
+            return "mode='reference' must not include first_frame/last_frame."
+        if not (images or audios or videos):
+            return "mode='reference' requires images, audios, or videos."
+    return None
+
+
 def _build_video_payload(
     *,
     prompt: str,
     model: str,
-    duration: float = 5.0,
-    frame_rate: int = 24,
-    resolution: str = "720p",
+    mode: str = "text",
+    seconds: str = "5",
+    size: str = "720P",
     aspect_ratio: str = "16:9",
-    image: str | None = None,
-    mode: str | None = None,
-    negative_prompt: str | None = None,
+    seed: int | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    images: list[str] | None = None,
+    audios: list[str] | None = None,
+    videos: list[dict[str, Any]] | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if duration <= 0:
-        raise ValueError("duration must be greater than zero.")
-    if frame_rate <= 0:
-        raise ValueError("frame_rate must be greater than zero.")
-    if frame_rate > 60:
-        raise ValueError("frame_rate must not exceed 60.")
-
-    width, height = _parse_dimensions(resolution, aspect_ratio)
-    raw_frames = int(round(duration * frame_rate))
-    num_frames = _align_num_frames(raw_frames)
     payload: dict[str, Any] = {
         "model": model,
         "prompt": prompt,
-        "num_frames": num_frames,
-        "frame_rate": frame_rate,
-        "width": width,
-        "height": height,
+        "mode": mode,
+        "seconds": seconds,
+        "size": size,
+        "aspect_ratio": aspect_ratio,
     }
-    if negative_prompt:
-        payload["negative_prompt"] = negative_prompt
-    if mode == "keyframes":
-        merged_extra = dict(extra_body or {})
-        if image:
-            merged_extra["image"] = [image]
-        merged_extra["mode"] = mode
-        payload["extra_body"] = merged_extra
-    else:
-        if image:
-            payload["image"] = image
-        if mode:
-            payload["mode"] = mode
-        if extra_body:
-            payload["extra_body"] = dict(extra_body)
+    if seed is not None:
+        payload["seed"] = seed
+    if mode == "keyframe":
+        if first_frame:
+            payload["first_frame"] = first_frame
+        if last_frame:
+            payload["last_frame"] = last_frame
+    if mode == "reference":
+        if images:
+            payload["images"] = images
+        if audios:
+            payload["audios"] = audios
+        if videos:
+            payload["videos"] = videos
+    if extra_body:
+        payload["extra_body"] = dict(extra_body)
     return payload
 
 
@@ -693,34 +755,54 @@ def _video_success_result(
 def _agnes_video_submit_impl(
     prompt: str,
     *,
-    duration: float = 5.0,
-    frame_rate: int = 24,
-    resolution: str = "720p",
+    model: str | None = None,
+    mode: str = "text",
+    seconds: str = "5",
+    size: str = "720P",
     aspect_ratio: str = "16:9",
-    image: str | None = None,
-    mode: str | None = None,
-    negative_prompt: str | None = None,
+    seed: int | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    images: list[str] | None = None,
+    audios: list[str] | None = None,
+    videos: list[dict[str, Any]] | None = None,
     extra_body: dict[str, Any] | None = None,
     include_raw: bool = False,
 ) -> dict[str, Any]:
     if not prompt.strip():
         return _error("invalid_prompt", "Prompt must not be empty.")
 
-    try:
-        payload = _build_video_payload(
-            prompt=prompt,
-            model=_video_model(),
-            duration=duration,
-            frame_rate=frame_rate,
-            resolution=resolution,
-            aspect_ratio=aspect_ratio,
-            image=image,
-            mode=mode,
-            negative_prompt=negative_prompt,
-            extra_body=extra_body,
-        )
-    except (TypeError, ValueError) as exc:
-        return _error("invalid_video_options", "Video options are invalid.", details=str(exc))
+    model = model or _video_model()
+    error_message = _validate_video_request(
+        model=model,
+        mode=mode,
+        size=size,
+        seconds=seconds,
+        aspect_ratio=aspect_ratio,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        images=images,
+        audios=audios,
+        videos=videos,
+    )
+    if error_message:
+        return _error("invalid_video_options", error_message)
+
+    payload = _build_video_payload(
+        prompt=prompt,
+        model=model,
+        mode=mode,
+        seconds=seconds,
+        size=size,
+        aspect_ratio=aspect_ratio,
+        seed=seed,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        images=images,
+        audios=audios,
+        videos=videos,
+        extra_body=extra_body,
+    )
 
     ok, response = _request_json("POST", "/videos", json_body=payload)
     if not ok:
@@ -732,14 +814,16 @@ def _agnes_video_submit_impl(
 def _agnes_video_status_impl(
     video_id: str,
     *,
+    model_name: str | None = None,
     include_raw: bool = False,
 ) -> dict[str, Any]:
     if not video_id.strip():
         return _error("invalid_video_id", "video_id must not be empty.")
 
+    model_name = model_name or _video_model()
     ok, response = _request_json(
         "GET",
-        f"/agnesapi?video_id={quote(video_id, safe='')}",
+        f"/agnesapi?video_id={quote(video_id, safe='')}&model_name={quote(model_name, safe='')}",
         base_url=_domain_root(),
     )
     if not ok:
@@ -770,6 +854,7 @@ def _download_video(
 def _agnes_video_wait_impl(
     video_id: str,
     *,
+    model_name: str | None = None,
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 5.0,
     download: bool = True,
@@ -789,7 +874,9 @@ def _agnes_video_wait_impl(
     last_response: dict[str, Any] | None = None
 
     for attempt in range(attempts):
-        last_response = _agnes_video_status_impl(video_id, include_raw=True)
+        last_response = _agnes_video_status_impl(
+            video_id, model_name=model_name, include_raw=True
+        )
         if not last_response.get("ok"):
             error = last_response.get("error")
             details = error.get("details") if isinstance(error, dict) else None
@@ -842,13 +929,17 @@ def _agnes_video_wait_impl(
 def _agnes_video_generate_impl(
     prompt: str,
     *,
-    duration: float = 5.0,
-    frame_rate: int = 24,
-    resolution: str = "720p",
+    model: str | None = None,
+    mode: str = "text",
+    seconds: str = "5",
+    size: str = "720P",
     aspect_ratio: str = "16:9",
-    image: str | None = None,
-    mode: str | None = None,
-    negative_prompt: str | None = None,
+    seed: int | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    images: list[str] | None = None,
+    audios: list[str] | None = None,
+    videos: list[dict[str, Any]] | None = None,
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 5.0,
     download: bool = True,
@@ -857,13 +948,17 @@ def _agnes_video_generate_impl(
 ) -> dict[str, Any]:
     submit_result = _agnes_video_submit_impl(
         prompt,
-        duration=duration,
-        frame_rate=frame_rate,
-        resolution=resolution,
-        aspect_ratio=aspect_ratio,
-        image=image,
+        model=model,
         mode=mode,
-        negative_prompt=negative_prompt,
+        seconds=seconds,
+        size=size,
+        aspect_ratio=aspect_ratio,
+        seed=seed,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        images=images,
+        audios=audios,
+        videos=videos,
         extra_body=extra_body,
         include_raw=True,
     )
@@ -880,6 +975,7 @@ def _agnes_video_generate_impl(
 
     wait_result = _agnes_video_wait_impl(
         video_id,
+        model_name=model or _video_model(),
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
         download=download,
@@ -894,19 +990,25 @@ def _agnes_video_generate_impl(
 def agnes_image_generate(
     prompt: str,
     size: str = "1024x1024",
+    ratio: str | None = None,
     return_base64: bool | None = None,
     response_format: str | None = None,
     image_urls: list[str] | None = None,
     output_filename: str | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Generate an image with Agnes Image 2.1 Flash and save returned image data when possible.
+    """Generate an image with Agnes Image 2.5 Flash (default; 2.1/2.0-flash via env).
 
-    Supports text-to-image and image-to-image (via image_urls). Size accepts exact
-    pixel dimensions such as '1024x768', '1024x1024', or '768x1024'.
+    Supports text-to-image, image-to-image and multi-image composition (via
+    image_urls). All three image models support tier sizes '1K'-'4K' with
+    'ratio' ('1:1','3:4','4:3','16:9','9:16','2:3','3:2','21:9'), plus legacy
+    exact sizes like '1024x768'. Put 'response_format' inside extra_body
+    (top-level response_format is rejected); pass 'return_base64' top-level
+    for base64 text-to-image. Never send tags: ["img2img"].
     """
     return _agnes_image_generate_impl(
         prompt,
+        ratio=ratio,
         size=size,
         return_base64=return_base64,
         response_format=response_format,
@@ -927,12 +1029,12 @@ def agnes_image_generate_v2(
     output_filename: str | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Generate an image with Agnes Image 2.1 Flash optimized for high-information-density visuals.
+    """Generate an image with Agnes Image 2.5 Flash (default) tuned for high-information-density visuals.
 
-    Supports text-to-image and image-to-image (via image_urls). Size accepts tier
-    values '1K', '2K', '3K', '4K' combined with ratio ('1:1', '3:4', '4:3',
-    '16:9', '9:16', '2:3', '3:2', '21:9'). Legacy exact sizes like '1024x768'
-    are also accepted.
+    Same request schema as agnes_image_generate but with tier-based sizing:
+    size '1K'/'2K'/'3K'/'4K' + ratio ('1:1','3:4','4:3','16:9','9:16','2:3',
+    '3:2','21:9'). Legacy exact sizes like '1024x768' are accepted and may be
+    normalized. image_urls enables image-to-image and multi-image composition.
     """
     return _agnes_image_generate_impl(
         prompt,
@@ -959,10 +1061,11 @@ def agnes_image_edit(
     output_filename: str | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit or compose images through Agnes img2img using URLs or local files.
+    """Edit, restyle, or compose images through Agnes img2img using URLs or local files.
 
-    Uses agnes-image-2.1-flash by default. Pass image_paths as public URLs or
-    local file paths. Multiple images enable multi-image composition.
+    Defaults to agnes-image-2.5-flash. Pass image_paths as public URLs, Data
+    URI base64, or local file paths. Multiple images enable multi-image
+    composition. Use tier size ('1K'-'4K') + ratio for predictable dimensions.
     """
     return _agnes_image_edit_impl(
         prompt,
@@ -980,53 +1083,78 @@ def agnes_image_edit(
 @mcp.tool()
 def agnes_video_submit(
     prompt: str,
-    duration: float = 5.0,
-    frame_rate: int = 24,
-    resolution: str = "720p",
+    mode: str = "text",
+    seconds: str = "5",
+    size: str = "720P",
     aspect_ratio: str = "16:9",
-    image: str | None = None,
-    mode: str | None = None,
-    negative_prompt: str | None = None,
+    seed: int | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    images: list[str] | None = None,
+    audios: list[str] | None = None,
+    videos: list[dict[str, Any]] | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Submit an Agnes video task and return its video id for status polling.
+    """Submit an Agnes video task (async) and return video_id + task_id.
 
-    Supports text-to-video, image-to-video (via image URL), and keyframe
-    animation (via extra_body with mode='keyframes'). num_frames is aligned
-    to the 8n+1 rule automatically.
+    Default model is agnes-video-2.5-flash (free, limited-time; 720P only,
+    images<=5, audios<=3, no reference videos). Set AGNES_VIDEO_MODEL or pass
+    model via extra_body to use agnes-video-2.5 (paid: 720P $0.025/s,
+    1080P/1K $0.040/s, 2K $0.055/s) or agnes-video-v2.0.
+
+    mode='text': prompt only. mode='keyframe': first_frame and/or last_frame
+    URLs. mode='reference': images and/or audios (2.5 also videos), referenced
+    in the prompt as <Picture 1>/<Audio 1>/<Video 1>.
+    seconds is a string '4'-'12'; size 720P/1080P/1K/2K (flash: 720P only).
     """
     return _agnes_video_submit_impl(
         prompt,
-        duration=duration,
-        frame_rate=frame_rate,
-        resolution=resolution,
-        aspect_ratio=aspect_ratio,
-        image=image,
         mode=mode,
-        negative_prompt=negative_prompt,
+        seconds=seconds,
+        size=size,
+        aspect_ratio=aspect_ratio,
+        seed=seed,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        images=images,
+        audios=audios,
+        videos=videos,
         extra_body=extra_body,
     )
 
 
 @mcp.tool()
-def agnes_video_status(video_id: str) -> dict[str, Any]:
-    """Fetch the current status for an Agnes video task by video_id."""
-    return _agnes_video_status_impl(video_id)
+def agnes_video_status(
+    video_id: str,
+    model_name: str | None = None,
+) -> dict[str, Any]:
+    """Fetch the current status of an Agnes video task.
+
+    Recommended query form: video_id + model_name (defaults to the configured
+    video model). A bare video_id query only works for mode='text' tasks.
+    """
+    return _agnes_video_status_impl(video_id, model_name=model_name)
 
 
 @mcp.tool()
 async def agnes_video_wait(
     video_id: str,
+    model_name: str | None = None,
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 5.0,
     download: bool = True,
     output_filename: str | None = None,
 ) -> dict[str, Any]:
-    """Poll a video task by video_id until it completes, fails, or times out."""
-    # ponytail: whole-call worker; make polling native-async if cancellation/load matters.
+    """Poll a video task by video_id until it completes, fails, or times out.
+
+    Poll every 1-2s server-side in production; this tool sleeps
+    poll_interval_seconds between checks. When status='completed' the video
+    is downloaded to the local output directory.
+    """
     return await asyncio.to_thread(
         _agnes_video_wait_impl,
         video_id,
+        model_name=model_name,
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
         download=download,
@@ -1037,13 +1165,16 @@ async def agnes_video_wait(
 @mcp.tool()
 async def agnes_video_generate(
     prompt: str,
-    duration: float = 5.0,
-    frame_rate: int = 24,
-    resolution: str = "720p",
+    mode: str = "text",
+    seconds: str = "5",
+    size: str = "720P",
     aspect_ratio: str = "16:9",
-    image: str | None = None,
-    mode: str | None = None,
-    negative_prompt: str | None = None,
+    seed: int | None = None,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    images: list[str] | None = None,
+    audios: list[str] | None = None,
+    videos: list[dict[str, Any]] | None = None,
     timeout_seconds: float = 600.0,
     poll_interval_seconds: float = 5.0,
     download: bool = True,
@@ -1052,20 +1183,24 @@ async def agnes_video_generate(
 ) -> dict[str, Any]:
     """Submit an Agnes video task and wait for completion.
 
-    Combines submit + wait into a single call. Returns the final video URL
-    and optionally downloads the video file locally.
+    Combines submit + wait. Returns the final video_url and downloads the
+    video file locally. Uses agnes-video-2.5-flash by default (free);
+    see agnes_video_submit for mode/media rules and paid-model notes.
     """
-    # ponytail: whole-call worker; make polling native-async if cancellation/load matters.
     return await asyncio.to_thread(
         _agnes_video_generate_impl,
         prompt,
-        duration=duration,
-        frame_rate=frame_rate,
-        resolution=resolution,
-        aspect_ratio=aspect_ratio,
-        image=image,
+        model=None,
         mode=mode,
-        negative_prompt=negative_prompt,
+        seconds=seconds,
+        size=size,
+        aspect_ratio=aspect_ratio,
+        seed=seed,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        images=images,
+        audios=audios,
+        videos=videos,
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
         download=download,
