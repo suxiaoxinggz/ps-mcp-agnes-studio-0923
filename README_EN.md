@@ -1,5 +1,7 @@
 # Agnes Media MCP
 
+> **⚠️ 2026-09 Update**: The model list and video API have been overhauled (image `agnes-image-2.5-flash`/`2.1`/`2.0-flash` with 1K–4K tiers + ratio; async OpenAI-Videos-compatible API with `text`/`keyframe`/`reference` modes). This English README is pending re-translation — the up-to-date model list, parameter tables and deployment JSON are in [README.md](README.md) (Chinese) and `SKILL.md` / `docs/`.
+
 [中文](README.md)
 
 A FastMCP-based Agnes image and video generation MCP server (China edition).

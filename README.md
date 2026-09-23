@@ -1,339 +1,181 @@
 # Agnes Media MCP
 
-> **2026-09 模型与视频 API 更新**：图片模型更新为 `agnes-image-2.5-flash`（默认）/ `2.1-flash` / `2.0-flash`，均支持 `1K`–`4K` 档位 + `ratio`（2.0 兼容历史精确尺寸）。视频 API 重写为 OpenAI Videos 兼容异步接口：`POST /v1/videos` 创建 → `GET /agnesapi?video_id=&model_name=` 轮询，模式 `text` / `keyframe` / `reference`，模型 `agnes-video-2.5-flash`（限时免费，仅 720P）/ `agnes-video-2.5`（收费）/ `agnes-video-v2.0`。最新参数以 `SKILL.md` 与 `docs/image-api.md`、`docs/video-api.md` 为准。
+![Python](https://img.shields.io/badge/python-3.11%2B-brightgreen.svg)
+![MCP](https://img.shields.io/badge/MCP-Stdio-orange.svg)
+![Image](https://img.shields.io/badge/Image-2.5%2F2.1%2F2.0--flash-blue.svg)
+![Video](https://img.shields.io/badge/Video-2.5%2F2.5--flash%2Fv2.0-blue.svg)
 
-[English](README_EN.md)
+> **2026-09 模型与视频 API 更新**：图片模型 `agnes-image-2.5-flash`（默认）/ `2.1-flash` / `2.0-flash`，均支持 `1K`–`4K` 档位 + `ratio`；视频 API 重写为 OpenAI Videos 兼容异步接口（`POST /v1/videos` → `GET /agnesapi?video_id=&model_name=`），模型 `agnes-video-2.5-flash`（限时免费）/ `agnes-video-2.5`（收费）/ `agnes-video-v2.0`。
 
-基于 FastMCP 的 Agnes 图像与视频生成 MCP 服务器（国内版）。
-
-> **国内版 / 国际版说明：** 本文档以国内版（`https://api.agnes-ai.cn/v1`）为例。国际版请将 `AGNES_BASE_URL` 设置为 `https://apihub.agnes-ai.com/v1`；请求参数和用法基本一致。
->
-> ⚠️ **注意：两个平台的账号不互通，API Key 不共用。** 国内版 Key 无法在国际版端点使用，反之亦然。切换端点时必须在对应平台单独申请 Key。
-
-本服务通过环境变量读取凭据，请勿将真实 API Key 放入版本控制文件。
+---
 
 ## 这是什么？
 
-本项目由两部分组成，**配套使用**：
+一个 FastMCP Server，让 AI CLI（Claude Code / WorkBuddy / Codex / Qwen Code 等）直接调用 Agnes AI 的图片与视频生成能力：
 
-| 组件 | 文件 | 作用 |
-|------|------|------|
-| **MCP Server** | `src/agnes_media_mcp/` | 执行层——接收工具调用，请求 Agnes API，保存生成结果 |
-| **Skill** | `SKILL.md` | 决策层——告诉 AI Agent 何时激活、选哪个工具、如何构造 Prompt、如何展示结果 |
-
-简单说：**Skill 是大脑，MCP 是双手**。只装 MCP 不装 Skill，Agent 不知道何时该调用这些工具；只装 Skill 不装 MCP，Agent 知道该做什么但没有工具可用。
-
-## 工作流程
-
-<a href="docs/workflow.svg" target="_blank">
-  <img src="docs/workflow.svg" alt="Agnes Media MCP 工作流程" width="480" />
-</a>
-
-**流程概览：**
+- 🖼️ **文生图 / 图生图 / 多图合成**（三个 flash 图像模型，支持编辑、风格迁移、角色合成）
+- 🎬 **文生视频 / 首尾帧控制 / 图·音·视频参考生成**（异步任务 + 自动轮询 + 本地下载）
+- 💾 结果自动下载到本地（URL 之外落一份本地文件）
+- 🔁 免费视频队列满（503）时的**后台重试脚本** `video_retry.py`
 
 ```
-用户请求 ─→ [② 包含 "agnes"?] ─否─→ 不激活，交给其他工具
-                    │是
-                    ▼
-         ③ 意图匹配 (Skill: When to Use)
-                    │
-                    ▼
-         ④ 决策规则 → 选择工具
-          ├─ 标准图像 → agnes_image_generate
-          ├─ 高分辨率 → agnes_image_generate_v2 (1K-4K + ratio)
-          ├─ 图像编辑 → agnes_image_edit
-          └─ 视频     → agnes_video_generate / submit+wait
-                    │
-                    ▼
-         ⑤ 构造 Prompt + 语言策略 (auto / original / review)
-                    │
-                    ▼
-         ⑥ MCP Server 处理 (payload / Base64 / 8n+1)
-                    │
-                    ▼
-         ⑦ Agnes API (api.agnes-ai.cn/v1)
-          ├─ 图像: 同步返回 b64_json / url
-          └─ 视频: video_id → 轮询 GET /agnesapi
-                    │
-                    ▼
-         ⑧ 保存文件 → outputs/images/ | outputs/videos/
-                    │
-                    ▼
-         ⑨ Agent 展示结果 (Markdown / 路径 / URL)
-                    │
-                    ▼
-         ⑩ 用户获得媒体文件
+CLI 宿主 ──stdio──> Agnes Media MCP ──HTTPS──> apihub.agnes-ai.com（或 api.agnes-ai.cn）
+                                                    ├─ /v1/images/generations   图片（同步）
+                                                    ├─ /v1/videos               视频建任务（异步）
+                                                    └─ /agnesapi?video_id=...   视频轮询
 ```
 
-> **Skill 层**（②③④⑤⑨）负责触发判断、工具选择、Prompt 构造和结果展示；**MCP 层**（⑥⑧）负责协议适配；**API 层**（⑦）负责实际推理。
+---
 
-## 工具列表
+## 🧩 模型列表
 
-| 工具名 | 说明 |
-|--------|------|
-| `agnes_image_generate` | 文生图 / 图生图 / 多图合成（默认 `agnes-image-2.5-flash`），档位 `1K`–`4K` + `ratio` 或精确像素尺寸 |
-| `agnes_image_generate_v2` | 高信息密度图像生成（默认 `agnes-image-2.5-flash`），分级尺寸 `1K`–`4K` + 宽高比 |
-| `agnes_image_edit` | 图像编辑 / 多图合成，通过 `extra_body.image` 传入参考图 |
-| `agnes_video_submit` | 提交视频任务（`POST /videos`，异步），返回 `video_id`；`mode` = `text`/`keyframe`/`reference` |
-| `agnes_video_status` | 查询视频任务状态（`GET /agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL>`，推荐带 model_name） |
-| `agnes_video_wait` | 轮询任务直至完成、失败或超时（可自动下载 mp4） |
-| `agnes_video_generate` | 提交视频任务并等待完成（submit + wait 组合） |
+### 图片模型（均免费，限时）
 
-> **视频模型**：默认 `agnes-video-2.5-flash`（限时免费，仅 `720P`，参考图 ≤5、参考音频 ≤3、不支持参考视频）；`agnes-video-2.5` 收费（720P $0.025/s、1080P/1K $0.040/s、2K $0.055/s）；`agnes-video-v2.0` 接口兼容 2.5。通过 `AGNES_VIDEO_MODEL` 或工具 `extra_body.model` 切换。视频队列满（503 `video_queue_full`）时用 `video_retry.py` 后台重试（见注意事项）。
+| 模型 | 特点 |
+|---|---|
+| `agnes-image-2.5-flash` | **最新一代（默认）**，综合能力全面超过 2.1；高信息密度、构图保留 |
+| `agnes-image-2.1-flash` | 高信息密度、复杂构图；与 2.5 同 schema |
+| `agnes-image-2.0-flash` | 高性能基线；图像编辑 ELO 1184（Top 20）；兼容历史精确尺寸 |
 
-## 完整安装配置指南
+### 视频模型
 
-> 前提：已安装 [uv](https://docs.astral.sh/uv/)（一行脚本即可安装，支持 Windows / macOS / Linux）。
+| 模型 | 定价 | 限制 |
+|---|---|---|
+| `agnes-video-2.5-flash` | **限时 $0/s**（原价 720P $0.025/s） | **仅 720P**；参考图 ≤5；参考音频 ≤3；不支持参考视频 |
+| `agnes-video-2.5` | 720P $0.025/s、1080P/1K $0.040/s、2K $0.055/s（按秒，输入视频秒数计入） | 参考图 ≤8（前 5 张免费）、参考视频 ≤1（2–12s）、参考音频 ≤3 |
+| `agnes-video-v2.0` | 旧版模型，接口兼容 2.5 | 同 2.5 |
 
-### 第一步：安装 Skill
+---
 
-Skill 是一个 Markdown 文件，告诉 AI Agent 如何智能地使用本工具。将 `SKILL.md` 复制到你的 Agent 的 Skills 目录：
+## 🛠 工具列表与支持参数
 
-**Hermes：**
-```bash
-# 克隆仓库（或仅下载 SKILL.md）
-git clone https://github.com/Ryderey/agnes-mcp-studio
+### 图片（3 个工具，同一 API：`POST /v1/images/generations`）
 
-# 复制 Skill 到 Hermes skills 目录
-cp agnes-mcp-studio/SKILL.md ~/.hermes/skills/agnes-media-generation.md
-```
+| 工具 | 默认模型 | 用途 |
+|---|---|---|
+| `agnes_image_generate` | `agnes-image-2.5-flash` | 文生图 / 图生图 / 多图合成（通用入口） |
+| `agnes_image_generate_v2` | `agnes-image-2.5-flash` | 同上，默认使用**档位尺寸**（高分辨率/海报优先） |
+| `agnes_image_edit` | `agnes-image-2.5-flash` | 编辑/合成入口（`image_paths` 支持 URL、Data URI、本地路径自动转 base64） |
 
-> 🇨🇳 **国内用户：** 若无法访问 GitHub，请改用 Gitee 镜像：`git clone https://gitee.com/zzol_wow/agnes-mcp-studio`（内容完全一致，后文配置命令同理替换）。
+**参数表**：
 
-**Qoder / Cursor / 其他支持 Skill 的客户端：**
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `prompt` | ✅ | ≤500 字。结构：[主体]+[场景]+[风格]+[光照]+[构图]+[质量]；编辑时写清"改什么+保留什么" |
+| `size` | ✅ | 推荐 `1K`/`2K`/`3K`/`4K` 档位；兼容 `1024x768` 等历史精确尺寸（不支持的会被标准化） |
+| `ratio` | — | 配合档位 `size`：`1:1` `3:4` `4:3` `16:9` `9:16` `2:3` `3:2` `21:9`（默认 `1:1`）。如 16:9 的 2K = `2624x1472` |
+| `image_urls` | 图生图/多图必填 | 图片数组：公网 URL、Data URI Base64、**本地路径（自动转 base64）**；多图合成传多张 |
+| `return_base64` | — | 顶层参数，文生图返回 base64 时使用 |
+| `response_format` | — | `url` / `b64_json`——**必须放在 `extra_body` 内，顶层会报错** |
+| `output_filename` / `extra_body` | — | 本地保存名 / 其他高级参数透传 |
 
-将 `SKILL.md` 复制到对应的 Skills/Plugins 目录，或通过客户端的「安装 Skill」功能导入。
+⚠️ 图生图**不需要** `tags: ["img2img"]`；响应：`data[0].url` / `data[0].b64_json` / `data[0].revised_prompt`。
 
-### 第二步：配置 MCP Server
+### 视频（4 个工具，异步 API）
 
-在你的 Agent 配置文件中添加 MCP 服务器。
+| 工具 | 用途 |
+|---|---|
+| `agnes_video_submit` | 提交任务，返回 `video_id` + `task_id` |
+| `agnes_video_status` | 按 `video_id` + `model_name` 查询状态/进度 |
+| `agnes_video_wait` | 轮询直到完成/失败/超时，完成后自动下载 mp4 |
+| `agnes_video_generate` | submit + wait 组合（一站式） |
 
-**通用 JSON 格式**（Claude Desktop / Cursor / Qoder）：
+**参数表**：
 
-```json
-{
-  "mcpServers": {
-    "agnes_media": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/Ryderey/agnes-mcp-studio",
-        "agnes-media-mcp"
-      ],
-      "env": {
-        "AGNES_API_KEY": "your_agnes_api_key_here"
-      }
-    }
-  }
-}
-```
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `prompt` | ✅ | 主体+动作+镜头+风格(+声音)；reference 模式用 `<Picture 1>` / `<Audio 1>` / `<Video 1>` 指代素材 |
+| `mode` | ✅ | `text`（纯文生视频，禁止媒体字段）/ `keyframe`（首尾帧控制）/ `reference`（图/音/视频参考） |
+| `seconds` | — | **字符串** `"4"`–`"12"`，默认 `"5"` |
+| `size` | — | `720P` / `1080P` / `1K`（=1024x1024）/ `2K`；**flash 仅 `720P`** |
+| `aspect_ratio` | — | `21:9` `16:9` `4:3` `1:1` `3:4` `9:16`（+`2:3` `3:2`），默认 `16:9`；不支持 `auto` 或像素写法 |
+| `first_frame` / `last_frame` | keyframe | 首帧/尾帧图片 URL（至少一个） |
+| `images` | reference | 参考图 URL 列表（2.5 ≤8 张，flash ≤5 张） |
+| `audios` | reference | 参考音频 URL 列表（≤3 段，2–12s） |
+| `videos` | reference（2.5） | 参考视频 `{url, start_seconds, require_audio}`（≤1 个，2–12s，<50MB，24–60FPS）；**flash 不支持** |
+| `model_name` | status/wait | 轮询时指定模型（默认跟随配置）；不带 `model_name` 的裸查询仅适用 `mode:"text"` |
 
-> 🇨🇳 **国内用户：** 将 `git+https://github.com/Ryderey/agnes-mcp-studio` 替换为 `git+https://gitee.com/zzol_wow/agnes-mcp-studio` 即可。
+⚠️ `n` 仅支持 `1`；`width/height/fps/num_frames/quality` 等字段不受支持（会 400）；媒体 URL 必须公网可访问且在任务完成前有效。
 
-**Hermes YAML 格式：**
+---
 
-```yaml
-mcp_servers:
-  agnes_media:
-    command: "uvx"
-    args:
-      - "--from"
-      - "git+https://github.com/Ryderey/agnes-mcp-studio"   # 国内用户替换为 git+https://gitee.com/zzol_wow/agnes-mcp-studio
-      - "agnes-media-mcp"
-    env:
-      AGNES_API_KEY: "your_agnes_api_key_here"
-      AGNES_OUTPUT_DIR: "/absolute/path/to/outputs"
-    timeout: 600
-    connect_timeout: 60
-```
-
-### 第三步：获取 API Key
-
-1. 登录 [Agnes AI 控制台](https://www.agnes-ai.cn)
-2. 进入 API Key 管理页面，创建并复制 Key
-3. 将 Key 填入上一步配置中的 `AGNES_API_KEY`
-
-### 环境变量
-
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|:----:|--------|------|
-| `AGNES_API_KEY` | 是 | — | Agnes AI 平台 API Key |
-| `AGNES_BASE_URL` | 否 | `https://api.agnes-ai.cn/v1` | API 基础地址（国际版为 `https://apihub.agnes-ai.com/v1`） |
-| `AGNES_IMAGE_MODEL` | 否 | `agnes-image-2.1-flash` | `agnes_image_generate` / `agnes_image_edit` 默认模型 |
-| `AGNES_IMAGE_MODEL_V2` | 否 | `agnes-image-2.1-flash` | `agnes_image_generate_v2` 默认模型 |
-| `AGNES_VIDEO_MODEL` | 否 | `agnes-video-v2.0` | 视频生成默认模型 |
-| `AGNES_OUTPUT_DIR` | 否 | 源码树：`项目根/outputs`；安装后：`CWD/outputs` | 生成文件输出目录（建议配置绝对路径） |
-
-本地开发模式也可将变量写入 `.env` 文件（参考 `.env.example`，启动时自动加载）。切换国内 / 国际端点时，必须同时更换为对应平台签发的 Key。
-
-### 第四步：验证
-
-重启 Agent 后，确认 MCP 服务已连接：
+## 🚀 安装与配置
 
 ```bash
-# Hermes
-hermes mcp list
-hermes mcp test agnes_media
-```
-
-其他客户端通常在设置界面可查看 MCP 连接状态。
-
-### 可选：本地开发模式
-
-如果你想修改源码或调试：
-
-```bash
-git clone https://github.com/Ryderey/agnes-mcp-studio   # 国内用户：git clone https://gitee.com/zzol_wow/agnes-mcp-studio
+git clone https://github.com/suxiaoxinggz/agnes-mcp-studio.git
 cd agnes-mcp-studio
-uv sync
-cp .env.example .env   # 编辑 .env 填入 API Key
-uv run agnes-media-mcp
+pip install -e .          # 或 uv sync
+cp .env.example .env      # 填入 AGNES_API_KEY
 ```
 
-### 可选：预装到本地（快速启动）
+`.env` 关键项（⚠️ `.cn` 与 `.com` 平台账号不互通，Key 不共用）：
 
-`uvx --from git+...` 首次启动需克隆仓库并安装依赖，可能耗时数十秒；若你的客户端 MCP 连接超时较短（如 WorkBuddy），建议先预装到本地：
-
-```bash
-# 一次性安装（国内用 gitee 源，海外用 github 源）
-uv tool install --from git+https://gitee.com/zzol_wow/agnes-mcp-studio agnes-media-mcp
+```dotenv
+AGNES_API_KEY=your-key
+AGNES_BASE_URL=https://api.agnes-ai.cn/v1        # 国际站: https://apihub.agnes-ai.com/v1
+AGNES_IMAGE_MODEL=agnes-image-2.5-flash          # 2.5 / 2.1 / 2.0-flash
+AGNES_IMAGE_MODEL_V2=agnes-image-2.5-flash
+AGNES_VIDEO_MODEL=agnes-video-2.5-flash          # 2.5-flash / 2.5 / v2.0
+AGNES_OUTPUT_DIR=./outputs
 ```
 
-安装后可执行文件位于 `~/.local/bin/agnes-media-mcp`（Windows：`%USERPROFILE%\.local\bin\agnes-media-mcp.exe`），MCP 配置直接指向它，启动仅需约 2 秒：
+MCP 客户端 JSON（所有支持 `mcpServers` 的宿主通用）：
 
 ```json
 {
   "mcpServers": {
-    "agnes_media": {
-      "command": "C:\\Users\\<用户名>\\.local\\bin\\agnes-media-mcp.exe",
-      "args": [],
-      "env": {
-        "AGNES_API_KEY": "your_agnes_api_key_here"
-      }
+    "agnes-media": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/agnes-mcp-studio", "run", "agnes-media-mcp"],
+      "env": { "AGNES_API_KEY": "<YOUR_KEY>", "AGNES_BASE_URL": "https://api.agnes-ai.cn/v1" }
     }
   }
 }
 ```
 
-> macOS / Linux 将 `command` 换为 `~/.local/bin/agnes-media-mcp` 的绝对路径即可。后续升级只需重新执行 `uv tool install` 命令。
+### 免费视频队列满（503）？用后台重试
 
-## 使用示例
-
-安装配置完成后，在对话中提及 **agnes** 关键词即可触发。以下是实际对话示例：
-
-### Prompt 语言策略
-
-Skill 默认在调用 Agnes 前将非英文描述优化为自然英文；这通常能让图像和视频模型更稳定地理解风格、镜头与构图。用户可随时通过自然语言覆盖默认行为：
-
-| 模式 | 如何选择 | 行为 |
-|------|----------|------|
-| `auto`（默认） | 无需说明 | 自动翻译并优化为英文，不额外询问 |
-| `original` | “不要翻译”“保留中文提示词” | 优化提示词，但保持原语言 |
-| `review` | “先给我中英文版本选择” | 展示原文和英文版，等待用户选择后再调用 |
-
-同一对话中明确设置的偏好会继续沿用。翻译会保留专有名词、数值、镜头要求及必须出现在画面中的原文文字；Agent 与用户的交流语言不会因此改变。
-
-### 生成图像
-
-> **你：** 用 agnes 生成一张赛博朋克城市夜景，16:9 壁纸，2K 分辨率
->
-> **Agent：** 调用 `agnes_image_generate_v2`（size=2K, ratio=16:9）→ 返回图片文件
->
-> **你获得：** 一张 2624×1472 的图像，保存在 `outputs/images/` 目录
-
-### 编辑图像
-
-> **你：** 用 agnes 把这张照片的背景换成星空，保持人物不变 [附图]
->
-> **Agent：** 调用 `agnes_image_edit`（image_paths=[你的图片], prompt=...）→ 返回编辑后的图片
-
-### 生成视频
-
-> **你：** 用 agnes 做一个 5 秒的视频：一只猫在窗台上打盹，阳光慢慢移动
->
-> **Agent：** 调用 `agnes_video_generate`（mode="text", seconds="5", size="720P", aspect_ratio="16:9"）→ 自动轮询 → 返回视频文件
->
-> **你获得：** 一个 MP4 文件，保存在 `outputs/videos/` 目录；如遇 503 队列满，改用 `video_retry.py` 后台重试（见注意事项）
-
-### 触发规则
-
-| 你说的话 | 是否触发 |
-|----------|----------|
-| “用 agnes 画一只猫” | ✅ 触发（包含 agnes + 图像生成意图） |
-| “帮我生成一张图片” | ❌ 不触发（未提及 agnes） |
-| “agnes 是什么？” | ❌ 不触发（无生成意图） |
-| “AGNES generate a wallpaper” | ✅ 触发（不区分大小写） |
-
-## 开发者参考
-
-### 本地验证
+免费 `agnes-video-2.5-flash` 的队列经常满载（503 `video_queue_full`）。不要阻塞对话，用后台重试脚本：
 
 ```bash
-uv run python -c "from agnes_media_mcp.server import mcp; print('import ok')"
-uv run python -m pytest tests/ -v
+cd agnes-mcp-studio
+nohup python3 video_retry.py \
+  --prompt "视频描述..." --seconds 5 --size 720P --aspect-ratio 16:9 --notify \
+  > /tmp/agnes-video-retry.log 2>&1 &
 ```
 
-### Python API 直接调用
+- 每 `--interval` 秒（默认 600）重提一次，直到队列受理；随后自动轮询并下载 mp4 到 `outputs/videos/`
+- 400/401/403 等不可重试错误会立即退出并写日志
+- `--notify` 在出片时发 macOS 系统通知；日志在 `/tmp/agnes-video-retry.log`
+- 想立即出片可切付费 `agnes-video-2.5`（5s 720P ≈ $0.125）——需你明确同意花费
 
-以下为无需通过 Agent 的编程调用示例：
+---
 
-```python
-import asyncio
+## ✅ 验证结果（实测，2026-09）
 
-from agnes_media_mcp.server import agnes_image_generate, agnes_image_generate_v2, agnes_video_generate
+| 测试 | 结果 |
+|---|---|
+| `agnes_image_generate`（2.5-flash，1024x1024，`response_format=url`） | ✅ 1024×1024 PNG 991KB（`outputs/images/`），`data[0].url` 正常返回 |
+| Base URL 行为 | `.cn` 返回 401 时 `.com` 正常（Key 与站点必须匹配；两站账号不互通） |
+| `agnes_video_generate`（2.5-flash） | ⚠️ 请求格式验证正确；免费队列满载期间服务端持续返回 503 `video_queue_full`（非参数错误），用 `video_retry.py` 等待空闲即可 |
+| 7 个工具注册 | ✅ FastMCP 正常暴露 |
 
-# 标准图像生成
-result = agnes_image_generate(
-    prompt="一只陶瓷咖啡杯放在钢制桌面上，柔和光线",
-    size="1024x1024",
-)
+---
 
-# 高分辨率图像生成
-result = agnes_image_generate_v2(
-    prompt="赛博朋克城市夜景，霓虹灯反射，电影质感",
-    size="2K",
-    ratio="16:9",
-)
+## 📁 项目结构
 
-# 视频生成
-result = asyncio.run(
-    agnes_video_generate(
-        prompt="缓慢推进镜头，玻璃雕塑在画廊中旋转",
-        duration=5,
-        resolution="720p",
-        aspect_ratio="16:9",
-    )
-)
+```
+agnes-mcp-studio/
+├── src/agnes_media_mcp/server.py   # FastMCP Server（7 个工具）
+├── video_retry.py                  # 免费视频队列后台重试脚本
+├── docs/image-api.md               # 图片 API 参考（3 模型 + 尺寸表 + 示例）
+├── docs/video-api.md               # 视频 API 参考（模式规则 + 限制 + 计费）
+├── docs/configuration.md           # 配置指南
+├── SKILL.md                        # Agent Skill 指南（工具选择 / 模式规则 / 恢复策略）
+├── .env.example                    # 环境变量模板
+└── tests/
 ```
 
-> Prompt 语言策略由 Skill 层执行。直接调用 Python API 或 MCP 工具时，`prompt` 会按原样发送，不会自动翻译。
->
-> `agnes_video_wait` 和 `agnes_video_generate` 可能运行数分钟，测试时建议使用较短超时。
+## 📄 License
 
-## 文档
-
-详细 API 文档请参阅 `docs/` 目录：
-
-- [图像 API 文档](docs/image-api.md)
-- [视频 API 文档](docs/video-api.md)
-- [配置指南](docs/configuration.md)
-
-## 注意事项
-
-- Base URL 使用国内端点：`https://api.agnes-ai.cn/v1`
-- `response_format` 必须放在 `extra_body` 内，不可置于请求体顶层
-- 图生图不使用 `tags: ["img2img"]`，参考图通过 `extra_body.image` 传入
-- `agnes_image_generate_v2` 默认 `agnes-image-2.5-flash`（2026-09 起图片模型为 2.5/2.1/2.0-flash 三代），支持 `1K`–`4K` 分级尺寸 + `ratio` 宽高比
-- 视频状态轮询使用 `video_id` + `model_name`，端点为 `GET /agnesapi?video_id=<VIDEO_ID>&model_name=<MODEL>`（不带 model_name 仅适用 `mode:"text"`）
-- 视频 `seconds` 为字符串 `"4"`–`"12"`；Flash 模型 `size` 仅支持 `720P`，且不接受参考视频
-- **免费视频队列经常满载（503 `video_queue_full`）**：用后台重试脚本代替阻塞等待——
-  `nohup python3 video_retry.py --prompt "..." --seconds 5 --size 720P --notify > /tmp/agnes-video-retry.log 2>&1 &`
-  （每 10 分钟重试提交，成功后自动轮询、下载 mp4 并发 macOS 通知；`--max-submit-attempts 3` 可限制重试次数）
-- 视频结果 URL 从响应的顶层 `url` 字段提取（实测），同时兼容 `metadata.url`（官方文档示例）
-- 成功响应仅返回归一化关键字段，不返回完整 `raw`；HTTP 错误仍保留服务端响应正文
-- `mask_path` 参数会返回结构化不支持错误（当前文档未描述 mask 功能）
-- 超时响应包含 `video_id` 和 `last_response`，可稍后继续轮询
-
-## 许可证
-
-[MIT License](LICENSE)
+见 [LICENSE](LICENSE)。API 服务与额度遵循 Agnes AI 平台协议；公开文档请统一使用 `YOUR_API_KEY` 占位，不要暴露真实密钥。
